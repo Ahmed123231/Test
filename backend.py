@@ -169,17 +169,20 @@ class PhotoBooth:
 
 
 
-    # In backend.py - Add to PhotoBooth class
     def close_camera(self):
-        if getattr(self, 'camera', None) is not None:
-            try:
-                if hasattr(self.camera, "terminate"):
-                    self.camera.terminate()
-                    self.camera.wait(timeout=2)
-                    print("? ffmpeg camera process terminated")
-                self.camera = None
-            except Exception as e:
-                print(f"Error terminating camera: {str(e)}")
+        try:
+            if self.camera and hasattr(self.camera, 'release'):
+                self.camera.release()
+                print("? Camera released.")
+        except Exception as e:
+            print(f"Error releasing camera: {e}")
+        self.camera = None
+
+
+
+    def is_camera_open(self):
+        return self.camera is not None and self.camera.isOpened()
+
 
 
 
@@ -187,41 +190,32 @@ class PhotoBooth:
 
 
     def initialize_camera(self):
-        try:
-            command = [
-                "ffmpeg", "-f", "v4l2",
-                "-input_format", "mjpeg",  
-                "-framerate", "25",
-                "-video_size", "640x480",
-                "-pix_fmt", "yuv420p",
-                "-fflags", "nobuffer",
-                "-flags", "low_delay",
-                "-max_delay", "0",
-                "-i", "/dev/video0",
-                "-f", "image2pipe",
-                "-vcodec", "mjpeg", "-"
-            ]
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0
-            )
+        gst_pipeline = (
+            "v4l2src device=/dev/video0 ! "
+            "image/jpeg, width=640, height=480, framerate=30/1 ! "
+            "jpegdec ! "
+            "videoconvert ! appsink drop=true max-buffers=1 sync=false"
+        )
+        cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
 
-            time.sleep(2)  # Wait for ffmpeg to initialize
-            if process.poll() is not None:
-                err_output = process.stderr.read().decode("utf-8", errors="ignore")
-                print("? ffmpeg failed to start. stderr:\n", err_output)
-                return None
-
-            return process
-
-        except Exception as e:
-            print(f"Error initializing ffmpeg camera: {e}")
+        if not cap.isOpened():
+            print("? Failed to open GStreamer pipeline via OpenCV")
             return None
 
+        print("? GStreamer camera opened successfully")
+        return cap
+
+
+
     
+    def read_frame(self, cap):
     
+        if cap and hasattr(cap, 'read'):
+            ret, frame = cap.read()
+            if ret:
+                return frame
+        return None
+
     
     
     

@@ -200,113 +200,91 @@ class ProgressTracker:
                 print(f"Error in progress callback: {e}")
 
 
+def get_gstreamer_pipeline(
+    capture_width=1280,
+    capture_height=720,
+    display_width=640,
+    display_height=480,
+    framerate=30,
+    flip_method=0
+):
+    return (
+        f"v4l2src device=/dev/video0 ! "
+        f"image/jpeg, width={capture_width}, height={capture_height}, framerate={framerate}/1 ! "
+        f"jpegdec ! videoconvert ! videoscale ! "
+        f"video/x-raw, format=BGR, width={display_width}, height={display_height} ! "
+        f"appsink drop=1"
+    )
 
 
 
 
-class CameraThread:
-    """A dedicated thread for managing ffmpeg-based camera operations."""
-    def __init__(self, camera_init_func, frame_callback):
+class CameraCaptureThread(threading.Thread):
+    """Dedicated camera frame capture thread that pushes frames to a shared queue."""
+
+    def __init__(self, frame_queue: queue.Queue, init_camera_func: Callable, camera_init_func=None):
+
+        super().__init__(daemon=True)
+        self.frame_queue = frame_queue
+        self.init_camera_func = init_camera_func
         self.camera_init_func = camera_init_func
-        self.frame_callback = frame_callback
+        self.running = False
         self.camera = None
-        self.running = False
-        self.lock = threading.Lock()
-        self.thread = None
-        self.frame_interval = 1 / 30  # ~30 FPS
 
-    def start(self):
-        with self.lock:
-            if self.running:
-                return False
-            self.running = True
-            self.thread = threading.Thread(target=self._camera_loop, name="CameraThread", daemon=True)
-            self.thread.start()
-            return True
+    def run(self):
+        self.running = True
+        retries = 0
+        max_retries = 5
 
-    def stop(self):
-        self.running = False
-        if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=2.0)
+        while self.running:
+            try:
+                if self.camera is None or not self.camera.isOpened():
+                    print("?? Initializing camera...")
+                    self.camera = self.init_camera_func()
+                    retries += 1
+                    if not self.camera or not self.camera.isOpened():
+                        print("? Failed to open camera")
+                        if retries >= max_retries:
+                            print("?? Too many retries. Exiting thread.")
+                            break
+                        time.sleep(1)
+                        continue
+                    print("? Camera initialized")
+                    retries = 0  # Reset retry count
+
+                ret, frame = self.camera.read()
+                if not ret or frame is None:
+                    print("?? Failed to read frame. Reinitializing...")
+                    self.camera.release()
+                    self.camera = None
+                    time.sleep(1)
+                    continue
+
+                # Keep only latest frame (drop old ones)
+                while not self.frame_queue.empty():
+                    try:
+                        self.frame_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                self.frame_queue.put(frame)
+
+                time.sleep(1 / 30)  # 30 FPS target
+
+            except Exception as e:
+                print(f"?? Camera thread error: {e}")
+                traceback.print_exc()
+                time.sleep(1)
+
         self._terminate_camera()
 
     def _terminate_camera(self):
-        if self.camera and hasattr(self.camera, 'terminate'):
+        if self.camera and hasattr(self.camera, 'release'):
             try:
-                print("Terminating ffmpeg...")
-                self.camera.terminate()
-                try:
-                    self.camera.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    print("FFmpeg did not exit in time. Forcing kill...")
-                    self.camera.kill()
-                    self.camera.wait(timeout=1)
-                print("? ffmpeg terminated")
+                print("?? Releasing camera...")
+                self.camera.release()
             except Exception as e:
-                print(f"Error terminating ffmpeg: {e}")
-            self.camera = None
+                print(f"Error releasing camera: {e}")
+        self.camera = None
 
-    def _drain_stderr(self, stream):
-        try:
-            for _ in iter(stream.readline, b''):
-                pass  # You can log this if you want
-        except Exception as e:
-            print(f"Error draining stderr: {e}")
-
-    def _camera_loop(self):
-        buffer = b""
-        retries = 0
-        max_retries = 5
-    
-        while self.running:
-            try:
-                if not self.camera or self.camera.poll() is not None:
-                    print("?? ffmpeg process dead or not running. Restarting...")
-                    self._terminate_camera()
-                    self.camera = self.camera_init_func()
-                    retries += 1
-                    if retries >= max_retries:
-                        print("? Too many camera init failures.")
-                        break
-                    time.sleep(1)
-                    continue
-    
-                chunk = self.camera.stdout.read(4096)
-                if not chunk:
-                    print("?? No data from ffmpeg")
-                    retries += 1
-                    time.sleep(1)
-                    continue
-    
-                buffer += chunk
-                while True:
-                    start = buffer.find(b'\xff\xd8')
-                    end = buffer.find(b'\xff\xd9', start)
-                    if start != -1 and end != -1 and end > start:
-                        jpeg_data = buffer[start:end + 2]
-                        buffer = buffer[end + 2:]
-    
-                        # Decode JPEG
-                        image_array = np.frombuffer(jpeg_data, dtype=np.uint8)
-                        frame = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
-    
-                        if frame is not None and self.frame_callback:
-                            self.frame_callback(frame)
-                    else:
-                        # Wait for more data
-                        break
-    
-                retries = 0
-                time.sleep(self.frame_interval)
-    
-            except Exception as e:
-                print(f"Camera thread error: {e}")
-                traceback.print_exc()
-                self._terminate_camera()
-                retries += 1
-                time.sleep(1)
-    
-    
-    def is_running(self):
-        with self.lock:
-            return self.running and self.thread and self.thread.is_alive()
+    def stop(self):
+        self.running = False

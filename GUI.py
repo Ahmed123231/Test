@@ -12,6 +12,7 @@ from PIL import Image, ImageTk, ImageDraw, ImageColor, ImageFont
 from typing import Optional, Dict, Any, List, Tuple, Callable
 import queue
 import traceback
+from thread_utils import CameraCaptureThread
 
 try:
     import ttkthemes as tt
@@ -20,15 +21,12 @@ except ImportError:
     THEME_AVAILABLE = False
 
 from backend import PhotoBooth
-from thread_utils import ThreadPool, CameraThread, ProgressTracker
+from thread_utils import ThreadPool, ProgressTracker
 
 
 class DPIScaler:
     """Utility class for DPI scaling calculations."""
-    #def __init__(self):
-        # Cache for scale factors to avoid recalculating
-        #self.scale_cache = {}
-        
+     
     @staticmethod
     def get_dpi_scale(widget):
         """Get the DPI scaling factor."""
@@ -535,7 +533,10 @@ class PhotoPreviewCanvas(tk.Canvas):
         self.latest_frame = frame
         try:
             if isinstance(frame, np.ndarray):
-                image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                #image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                image = Image.fromarray(frame[:, :, ::-1])
+                #frame = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_LINEAR)
+
             elif isinstance(frame, Image.Image):
                 image = frame
             else:
@@ -599,13 +600,14 @@ class PhotoBoothGUI(tk.Tk):
         self.is_counting_down = False
         self.is_preview_frozen = False
         self.is_processing = False
+        #
         super().__init__()
         self.decorations = []
         self.decorations = []
-        self.preview_queue = queue.Queue(maxsize=3)
+        self.preview_queue = queue.Queue(maxsize=5)
         # Store reference to backend
         self.booth = booth_backend
-        
+        self.after(100, self._update_preview_ui)
         # Set window properties
         self.title("Eid Photo Booth")
         self.configure(bg="#FFFFFF")
@@ -618,6 +620,8 @@ class PhotoBoothGUI(tk.Tk):
         
         # Set up camera thread variables
         self.camera_thread = None
+        self.frame_queue = queue.Queue(maxsize=1)
+
         # In __init__ of PhotoBoothGUI class:
         self.preview_queue = queue.Queue(maxsize=2)  # Increased buffer size # Only keep latest frame
         
@@ -808,81 +812,37 @@ class PhotoBoothGUI(tk.Tk):
         self.update_idletasks()
 
 
-    def _handle_camera_init_result(self, _):
-        self.camera_thread = CameraThread(
-            camera_init_func=self.booth.initialize_camera,
-            frame_callback=self._on_frame_received
-        )
-        self.camera_thread.start()
-        self._log_status("?? Camera preview started")
-
-    #def _handle_camera_init_result(self, camera):
-
-
-        #if camera is None:
-        #  self._log_status("?? No camera detected - using test mode")
-        #    test_frame = self.booth.get_test_frame()
-        #    if test_frame is not None:
-        #        self._on_frame_received(test_frame)
-        #    self._start_simulation_mode()
-        #    self._set_buttons_state("preview", "normal")
-        #else:
-        #    self.camera_thread = CameraThread(
-        #        camera_init_func=self.booth.initialize_camera,
-        #        frame_callback=self._on_frame_received
-        #    )
-        #    self.camera_thread.start()
-        #    self._log_status("?? Camera preview started")        
-
 
 
 
 
 
     def _start_camera_preview(self):
-        """Start the camera preview thread."""
+        self._log_status("Initializing camera preview thread...")
+
+        self.camera_thread = CameraCaptureThread(
+            frame_queue=self.frame_queue,
+            init_camera_func=self.booth.initialize_camera
+
+        )
+        self.camera_thread.start()
+
+        self._poll_camera_frame()
 
 
-        self._handle_camera_init_result(None)
-        self._log_status("Initializing camera...")
-        # Initialize camera on a worker thread
-        #def init_camera_task():
-        #    return self.booth.initialize_camera()
-        #def init_camera_callback(camera):
-        #    self.after(0, self._handle_camera_init_result, camera)
-#
-        #self.thread_pool.submit(
-        #command_type="init_camera",
-        #data=init_camera_task,
-        #callback=init_camera_callback
-        #)
-        #self._log_status("Initializing camera...")
-            #if camera is None:
-             #   self._log_status("⚠️ No camera detected - using test mode")
-              #  # Create a test image right away for immediate feedback
-               # test_frame = self.booth.get_test_frame()
-                #if test_frame is not None:
-                 #   self._on_frame_received(test_frame)
-                    
-                # Start a simulation thread using the test frame generator
-                #self._start_simulation_mode()
-                # Enable capture button so we can test the workflow
-                #self._set_buttons_state("preview", "normal")
-                #return
-            
-            # Now that camera is ready, start the camera thread
-            #self.camera_thread = CameraThread(
-             #   camera_init_func=self.booth.initialize_camera,
-              #  frame_callback=self._on_frame_received
-            #)
-            #self.camera_thread.start()
-            #self._log_status("📸 Camera preview started")
-        
-        #self.thread_pool.submit(
-         #   command_type="init_camera",
-          #  data=self.booth.initialize_camera,
-           # callback=init_camera_callback
-        #)
+    def _poll_camera_frame(self):
+        try:
+            if not self.frame_queue.empty():
+                frame = self.frame_queue.get_nowait()
+                self.last_preview_frame = frame
+                self.preview_canvas.update_preview(frame)
+        except Exception as e:
+            print(f"Error polling camera frame: {e}")
+        finally:
+            if not self._is_closing:
+                self.after(30, self._poll_camera_frame)  # 30ms ~ 33FPS
+
+
       
     def _start_simulation_mode(self):
         """Start simulation mode with test frames when no camera is available."""
@@ -1009,36 +969,50 @@ class PhotoBoothGUI(tk.Tk):
 # In GUI.py - Update _on_frame_received
     def _on_frame_received(self, frame):
         """Callback for frame processing with load shedding"""
+        self.last_frame_time = time.time()
         try:
             if frame is None or self.is_preview_frozen:
                 return
     
             # Convert to RGB and resize before queuing
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame_small = cv2.resize(frame_rgb, (320, 240))
+            frame_small = cv2.resize(frame, (320, 240))  # Keep BGR as-is
+
             
             # Non-blocking queue put with frame dropping
+
             try:
-                self.preview_queue.put_nowait(frame_small)
+                self.preview_queue.put(frame_small, timeout=0.1)  # waits max 100ms
                 self.after_idle(self._update_preview_ui)
             except queue.Full:
-                pass  # Skip frame to prevent blocking
+                print("?? Preview queue full � dropping frame")
+
+                
+
                 
         except Exception as e:
             print(f"Frame handling error: {str(e)}")
 
 
     def _update_preview_ui(self):
+        if hasattr(self, 'last_frame_time') and (time.time() - self.last_frame_time > 5):
+            print("? No new frame in 5 seconds � restarting camera thread")
+            if self.camera_thread:
+                self.camera_thread.stop()
+                self.camera_thread.join()
+            self._start_camera_preview()
+            return
+
         try:
             frame = self.preview_queue.get_nowait()
             self.preview_canvas.update_preview(frame)
-            self.after(33, self._update_preview_ui)  # Throttle to ~30 FPS
         except queue.Empty:
-            #self.after(10, self._update_preview_ui)  # Retry sooner if empty
             pass
         except Exception as e:
             print(f"Preview update error: {str(e)}")
             traceback.print_exc()
+        finally:
+            self.after(33, self._update_preview_ui)
+
     
     def _on_capture_click(self):
         if self.is_processing:
